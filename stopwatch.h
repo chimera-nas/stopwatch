@@ -26,6 +26,15 @@
  * - On x86 with invariant TSC, uses RDTSC as the time base.
  * - Otherwise, falls back to clock_gettime(CLOCK_MONOTONIC, ...).
  *
+ * Frequency / conversion factors are obtained, in order of preference:
+ *   1. The Linux perf_event mmap page (cap_user_time): the kernel's own
+ *      TSC->ns mult/shift. Exact, requires no calibration, and its presence
+ *      is itself the kernel's verdict that the TSC is a safe timekeeping
+ *      source on this machine.
+ *   2. CPUID leaf 0x15 (Intel nominal TSC frequency).
+ *   3. A brief (~50ms) calibration against clock_gettime, refined once after
+ *      ~1 second of runtime.
+ *
  * Ticks:
  *   - TSC mode: ticks == TSC cycles
  *   - Non-TSC mode: ticks == nanoseconds
@@ -55,9 +64,19 @@
 #  include <x86intrin.h>  /* __rdtsc */
 #endif
 
+#if defined(__linux__)
+#  include <string.h>
+#  include <unistd.h>
+#  include <sys/mman.h>
+#  include <sys/syscall.h>
+#  include <linux/perf_event.h>
+#endif
+
 /* ---------- Configurable constants ---------- */
 
-/* Fixed-point shift for cycles -> ns conversion: ns = (cycles * mult) >> SHIFT */
+/* Fixed-point shift for the CPUID / calibration paths: ns = (cycles * mult) >> shift.
+ * The perf-page path supplies its own shift (stored in ctx->tsc_shift).
+ */
 #define STOPWATCH_TSC_SHIFT            32u
 
 /* Quick calibration interval (ns). Keep this short for init. */
@@ -68,7 +87,7 @@
 
 #ifndef unlikely
 #define unlikely(x)                     __builtin_expect(!!(x), 0)
-#endif 
+#endif
 
 #ifndef likely
 #define likely(x)                       __builtin_expect(!!(x), 1)
@@ -82,10 +101,11 @@ struct stopwatch_context {
     /* In TSC mode, these are meaningful. Otherwise, ignored. */
     uint64_t tsc_hz;          /* TSC frequency in Hz */
     uint64_t tsc_mult;        /* Fixed-point cycles->ns multiplier */
+    uint32_t tsc_shift;       /* Fixed-point shift for tsc_mult */
 
     int      tsc_from_cpuid;  /* 1 if tsc_hz came from CPUID 0x15, 0 if calibrated */
 
-    /* Refinement state (only used if tsc_from_cpuid == 0). */
+    /* Refinement state (only used if refine_done == 0). */
     uint64_t ref_tsc;         /* TSC value at reference time */
     struct timespec ref_time; /* timespec at reference time */
     uint64_t refine_threshold_cycles; /* cycles to wait before refining (~1s worth) */
@@ -94,7 +114,10 @@ struct stopwatch_context {
 };
 
 struct stopwatch {
-    struct timespec start; /* In TSC mode: start.tv_nsec holds TSC start value */
+    union {
+        uint64_t        ticks; /* TSC mode: start TSC value */
+        struct timespec ts;    /* Non-TSC mode: start CLOCK_MONOTONIC time */
+    } start;
 };
 
 /* ---------- Internal helpers ---------- */
@@ -127,7 +150,7 @@ stopwatch_monotonic_clock_id(void)
 #if defined(__i386__) || defined(__x86_64__)
 
 /* Check for invariant TSC via CPUID 0x80000007 EDX bit 8. */
-static int
+static inline int
 stopwatch_has_invariant_tsc(void)
 {
     unsigned int max_leaf = __get_cpuid_max(0x80000000u, NULL);
@@ -143,7 +166,7 @@ stopwatch_has_invariant_tsc(void)
 }
 
 /* Try to get TSC frequency via CPUID leaf 0x15 (Intel only). */
-static uint64_t
+static inline uint64_t
 stopwatch_get_tsc_hz_via_cpuid(void)
 {
     unsigned int max_leaf = __get_cpuid_max(0, NULL);
@@ -173,7 +196,7 @@ stopwatch_get_tsc_hz_via_cpuid(void)
 }
 
 /* Quick TSC calibration vs. clock_gettime over target_ns (nanoseconds). */
-static uint64_t
+static inline uint64_t
 stopwatch_calibrate_tsc_interval(uint64_t target_ns)
 {
     struct timespec t0, t1;
@@ -203,7 +226,7 @@ stopwatch_calibrate_tsc_interval(uint64_t target_ns)
 }
 
 /* Compute fixed-point multiplier for cycles->ns: ns = (cycles * mult) >> SHIFT */
-static uint64_t
+static inline uint64_t
 stopwatch_compute_tsc_mult(uint64_t tsc_hz)
 {
     if (tsc_hz == 0) {
@@ -216,15 +239,87 @@ stopwatch_compute_tsc_mult(uint64_t tsc_hz)
     return mult;
 }
 
-/* Possibly refine TSC frequency using the time since ref_tsc/ref_time.
- * Only runs once, after enough cycles have elapsed (~1 second worth).
+/*
+ * Tier 1: obtain the kernel's TSC->ns conversion factors from the perf_event
+ * mmap page. Returns 1 and populates tsc_mult / tsc_shift / tsc_hz on success.
+ *
+ * cap_user_time is only set when the kernel is actually driving timekeeping
+ * from the TSC (i.e. it passed the boot-time inter-core sync test and did not
+ * demote the clocksource), so success here doubles as the safety gate.
  */
-static  __attribute__((always_inline)) inline void 
+static inline int
+stopwatch_init_from_perf(struct stopwatch_context *ctx)
+{
+#if defined(__linux__)
+    struct perf_event_attr attr;
+
+    memset(&attr, 0, sizeof(attr));
+    attr.type           = PERF_TYPE_HARDWARE;
+    attr.config         = PERF_COUNT_HW_INSTRUCTIONS;
+    attr.size           = sizeof(attr);
+    attr.disabled       = 1;
+    attr.exclude_kernel = 1;
+    attr.exclude_hv     = 1;
+
+    int fd = (int)syscall(SYS_perf_event_open, &attr, 0 /* this process */, -1, -1, 0);
+    if (fd < 0) {
+        return 0; /* paranoid policy or unsupported; fall back */
+    }
+
+    void *addr = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);
+    if (addr == MAP_FAILED) {
+        close(fd);
+        return 0;
+    }
+
+    volatile struct perf_event_mmap_page *pc =
+        (volatile struct perf_event_mmap_page *)addr;
+
+    uint32_t seq, cap, time_mult, time_shift;
+
+    /* Seqlock: the kernel updates these factors live, so retry on an odd or
+     * changed sequence.
+     */
+    do {
+        seq = pc->lock;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        cap        = pc->cap_user_time;
+        time_mult  = pc->time_mult;
+        time_shift = pc->time_shift;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    } while (pc->lock != seq || (seq & 1));
+
+    munmap(addr, 4096);
+    close(fd);
+
+    if (!cap || time_mult == 0) {
+        return 0; /* kernel is not driving timekeeping from the TSC */
+    }
+
+    ctx->tsc_mult  = time_mult;
+    ctx->tsc_shift = time_shift;
+
+    /* Derive hz for ns->ticks: hz = (1e9 << shift) / mult. */
+    __int128 num = ((__int128)1000000000ULL << time_shift);
+    ctx->tsc_hz  = (uint64_t)(num / (__int128)time_mult);
+
+    return 1;
+#else  /* !__linux__ */
+    (void)ctx;
+    return 0;
+#endif /* __linux__ */
+}
+
+/* Possibly refine TSC frequency using the time since ref_tsc/ref_time.
+ * Only runs once, after enough cycles have elapsed (~1 second worth), and
+ * only on the calibration path (perf / CPUID set refine_done == 1).
+ */
+static  __attribute__((always_inline)) inline void
 stopwatch_maybe_refine(struct stopwatch_context *ctx, uint64_t now_tsc)
 {
     /* Only refine if:
      *  - using TSC
-     *  - initial frequency was calibrated (not CPUID)
+     *  - initial frequency was calibrated (not perf / CPUID)
      *  - we haven't refined yet
      */
 
@@ -275,13 +370,10 @@ stopwatch_maybe_refine(struct stopwatch_context *ctx, uint64_t now_tsc)
 /*
  * Initialize a stopwatch_context.
  *
- * - Detects if invariant TSC is available (x86 only).
- * - If yes:
- *     - Tries CPUID 0x15 for a direct TSC frequency (Intel).
- *     - Otherwise, performs a quick calibration (~50 ms).
- *     - Stores a reference (TSC, timespec) for possible one-time refinement.
- * - If no:
- *     - Falls back to clock_gettime(CLOCK_MONOTONIC, ...).
+ * - x86: tries the perf page, then CPUID 0x15, then calibration (see the
+ *   file header). Stores a reference (TSC, timespec) for a possible one-time
+ *   refinement only on the calibration path.
+ * - Otherwise: falls back to clock_gettime(CLOCK_MONOTONIC, ...).
  */
 static inline void
 stopwatch_context_init(struct stopwatch_context *ctx)
@@ -289,6 +381,7 @@ stopwatch_context_init(struct stopwatch_context *ctx)
     ctx->use_tsc           = 0;
     ctx->tsc_hz            = 0;
     ctx->tsc_mult          = 0;
+    ctx->tsc_shift         = STOPWATCH_TSC_SHIFT;
     ctx->tsc_from_cpuid    = 0;
     ctx->ref_tsc           = 0;
     ctx->ref_time.tv_sec   = 0;
@@ -298,9 +391,22 @@ stopwatch_context_init(struct stopwatch_context *ctx)
     ctx->refine_ns         = 0;
 
 #if defined(__i386__) || defined(__x86_64__)
+    /* Tier 1: kernel perf page. Exact factors, no calibration, and its
+     * presence is the kernel's verdict that the TSC is safe. The context
+     * stays immutable after this (no hot-path refinement).
+     */
+    if (stopwatch_init_from_perf(ctx)) {
+        ctx->use_tsc     = 1;
+        ctx->refine_done = 1;
+        return;
+    }
+
+    /* Tiers 2 and 3 derive the frequency ourselves, so require invariant TSC. */
     if (!stopwatch_has_invariant_tsc()) {
         return; /* TSC not safe; use clock_gettime. */
     }
+
+    ctx->tsc_shift = STOPWATCH_TSC_SHIFT;
 
     uint64_t tsc_hz = stopwatch_get_tsc_hz_via_cpuid();
     if (tsc_hz != 0) {
@@ -345,9 +451,9 @@ stopwatch_context_init(struct stopwatch_context *ctx)
  *
  * In TSC mode:
  *   - Optionally performs a one-time refinement if enough time has elapsed.
- *   - Stores current TSC in start.tv_nsec (tv_sec unused).
+ *   - Stores current TSC in start.ticks.
  * In non-TSC mode:
- *   - Stores current CLOCK_MONOTONIC time in start.
+ *   - Stores current CLOCK_MONOTONIC time in start.ts.
  */
 static __attribute__((always_inline)) inline void
 stopwatch_start(struct stopwatch_context *ctx, struct stopwatch *sw)
@@ -359,13 +465,13 @@ stopwatch_start(struct stopwatch_context *ctx, struct stopwatch *sw)
         /* Possibly refine TSC frequency once, using time since init. */
         stopwatch_maybe_refine(ctx, now);
 
-        sw->start.tv_nsec = (long)now;
+        sw->start.ticks = now;
 #else
         /* Should not happen, but fall back just in case. */
-        clock_gettime(CLOCK_MONOTONIC, &sw->start);
+        clock_gettime(CLOCK_MONOTONIC, &sw->start.ts);
 #endif
     } else {
-        clock_gettime(CLOCK_MONOTONIC, &sw->start);
+        clock_gettime(CLOCK_MONOTONIC, &sw->start.ts);
     }
 }
 
@@ -375,6 +481,10 @@ stopwatch_start(struct stopwatch_context *ctx, struct stopwatch *sw)
  * Returns:
  *   - TSC mode:  current_tsc - start_tsc
  *   - Non-TSC:   elapsed nanoseconds
+ *
+ * The TSC subtraction is clamped at zero: a start captured on one core and a
+ * read on another can see a small negative delta if the per-core TSCs are not
+ * perfectly aligned, and we would rather report 0 than a ~2^64 outlier.
  */
 static __attribute__((always_inline)) inline uint64_t
 stopwatch_read_ticks(const struct stopwatch_context *ctx,
@@ -382,19 +492,19 @@ stopwatch_read_ticks(const struct stopwatch_context *ctx,
 {
     if (ctx->use_tsc) {
 #if defined(__i386__) || defined(__x86_64__)
-        uint64_t now = __rdtsc();
-        uint64_t start = (uint64_t)sw->start.tv_nsec;
-        return now - start;
+        uint64_t now   = __rdtsc();
+        uint64_t start = sw->start.ticks;
+        return likely(now >= start) ? now - start : 0;
 #else
         /* Should not happen, but fall back. */
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        return stopwatch_timespec_diff_ns(&sw->start, &now);
+        return stopwatch_timespec_diff_ns(&sw->start.ts, &now);
 #endif
     } else {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        return stopwatch_timespec_diff_ns(&sw->start, &now);
+        return stopwatch_timespec_diff_ns(&sw->start.ts, &now);
     }
 }
 
@@ -402,7 +512,7 @@ stopwatch_read_ticks(const struct stopwatch_context *ctx,
  * Convert ticks -> nanoseconds.
  *
  * - TSC mode:
- *     ns = (ticks * tsc_mult) >> STOPWATCH_TSC_SHIFT
+ *     ns = (ticks * tsc_mult) >> tsc_shift
  * - Non-TSC mode:
  *     ns = ticks (ticks are already ns)
  */
@@ -414,9 +524,8 @@ stopwatch_ticks_to_ns(const struct stopwatch_context *ctx, uint64_t ticks)
     }
 
 #if defined(__i386__) || defined(__x86_64__)
-    uint64_t mult = ctx->tsc_mult;
-    __int128 prod = (__int128)ticks * (__int128)mult;
-    uint64_t ns = (uint64_t)(prod >> STOPWATCH_TSC_SHIFT);
+    __int128 prod = (__int128)ticks * (__int128)ctx->tsc_mult;
+    uint64_t ns = (uint64_t)(prod >> ctx->tsc_shift);
     return ns;
 #else
     /* Should not happen, but fallback. */
