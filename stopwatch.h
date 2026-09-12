@@ -59,7 +59,20 @@
 #include <stdint.h>
 #include <time.h>
 
-#if defined(__i386__) || defined(__x86_64__)
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#define STOPWATCH_INLINE __forceinline
+#else
+#define STOPWATCH_INLINE __attribute__((always_inline)) inline
+#endif
+
+#if !defined(_WIN32) && (defined(__i386__) || defined(__x86_64__))
 #  include <cpuid.h>
 #  include <x86intrin.h>  /* __rdtsc */
 #endif
@@ -86,16 +99,27 @@
 #define STOPWATCH_REFINE_AFTER_SECONDS 1ULL
 
 #ifndef unlikely
-#define unlikely(x)                     __builtin_expect(!!(x), 0)
+#ifdef _WIN32
+#define unlikely(x) (!!(x))
+#else
+#define unlikely(x) __builtin_expect(!!(x), 0)
+#endif
 #endif
 
 #ifndef likely
-#define likely(x)                       __builtin_expect(!!(x), 1)
+#ifdef _WIN32
+#define likely(x) (!!(x))
+#else
+#define likely(x) __builtin_expect(!!(x), 1)
+#endif
 #endif
 
 /* ---------- Data structures ---------- */
 
 struct stopwatch_context {
+#ifdef _WIN32
+    uint64_t qpc_hz;
+#endif
     int      use_tsc;         /* 0 = use clock_gettime, 1 = use TSC */
 
     /* In TSC mode, these are meaningful. Otherwise, ignored. */
@@ -137,6 +161,7 @@ stopwatch_timespec_diff_ns(const struct timespec *start,
     return (uint64_t)sec * 1000000000ULL + (uint64_t)nsec;
 }
 
+#ifndef _WIN32
 static inline clockid_t
 stopwatch_monotonic_clock_id(void)
 {
@@ -147,7 +172,9 @@ stopwatch_monotonic_clock_id(void)
 #endif
 }
 
-#if defined(__i386__) || defined(__x86_64__)
+#endif /* !_WIN32 */
+
+#if !defined(_WIN32) && (defined(__i386__) || defined(__x86_64__))
 
 /* Check for invariant TSC via CPUID 0x80000007 EDX bit 8. */
 static inline int
@@ -314,7 +341,7 @@ stopwatch_init_from_perf(struct stopwatch_context *ctx)
  * Only runs once, after enough cycles have elapsed (~1 second worth), and
  * only on the calibration path (perf / CPUID set refine_done == 1).
  */
-static  __attribute__((always_inline)) inline void
+static  STOPWATCH_INLINE void
 stopwatch_maybe_refine(struct stopwatch_context *ctx, uint64_t now_tsc)
 {
     /* Only refine if:
@@ -379,6 +406,11 @@ static inline void
 stopwatch_context_init(struct stopwatch_context *ctx)
 {
     ctx->use_tsc           = 0;
+#ifdef _WIN32
+    LARGE_INTEGER frequency;
+    QueryPerformanceFrequency(&frequency);
+    ctx->qpc_hz = (uint64_t) frequency.QuadPart;
+#endif
     ctx->tsc_hz            = 0;
     ctx->tsc_mult          = 0;
     ctx->tsc_shift         = STOPWATCH_TSC_SHIFT;
@@ -390,7 +422,7 @@ stopwatch_context_init(struct stopwatch_context *ctx)
     ctx->refine_done       = 1;  /* default: nothing to refine */
     ctx->refine_ns         = 0;
 
-#if defined(__i386__) || defined(__x86_64__)
+#if !defined(_WIN32) && (defined(__i386__) || defined(__x86_64__))
     /* Tier 1: kernel perf page. Exact factors, no calibration, and its
      * presence is the kernel's verdict that the TSC is safe. The context
      * stays immutable after this (no hot-path refinement).
@@ -455,11 +487,17 @@ stopwatch_context_init(struct stopwatch_context *ctx)
  * In non-TSC mode:
  *   - Stores current CLOCK_MONOTONIC time in start.ts.
  */
-static __attribute__((always_inline)) inline void
+static STOPWATCH_INLINE void
 stopwatch_start(struct stopwatch_context *ctx, struct stopwatch *sw)
 {
+#ifdef _WIN32
+    LARGE_INTEGER counter;
+    (void) ctx;
+    QueryPerformanceCounter(&counter);
+    sw->start.ticks = (uint64_t) counter.QuadPart;
+#else
     if (ctx->use_tsc) {
-#if defined(__i386__) || defined(__x86_64__)
+#if !defined(_WIN32) && (defined(__i386__) || defined(__x86_64__))
         uint64_t now = __rdtsc();
 
         /* Possibly refine TSC frequency once, using time since init. */
@@ -473,6 +511,7 @@ stopwatch_start(struct stopwatch_context *ctx, struct stopwatch *sw)
     } else {
         clock_gettime(CLOCK_MONOTONIC, &sw->start.ts);
     }
+#endif
 }
 
 /*
@@ -486,12 +525,19 @@ stopwatch_start(struct stopwatch_context *ctx, struct stopwatch *sw)
  * read on another can see a small negative delta if the per-core TSCs are not
  * perfectly aligned, and we would rather report 0 than a ~2^64 outlier.
  */
-static __attribute__((always_inline)) inline uint64_t
+static STOPWATCH_INLINE uint64_t
 stopwatch_read_ticks(const struct stopwatch_context *ctx,
                      const struct stopwatch *sw)
 {
+#ifdef _WIN32
+    LARGE_INTEGER counter;
+    (void) ctx;
+    QueryPerformanceCounter(&counter);
+    uint64_t now = (uint64_t) counter.QuadPart;
+    return now >= sw->start.ticks ? now - sw->start.ticks : 0;
+#else
     if (ctx->use_tsc) {
-#if defined(__i386__) || defined(__x86_64__)
+#if !defined(_WIN32) && (defined(__i386__) || defined(__x86_64__))
         uint64_t now   = __rdtsc();
         uint64_t start = sw->start.ticks;
         return likely(now >= start) ? now - start : 0;
@@ -506,6 +552,7 @@ stopwatch_read_ticks(const struct stopwatch_context *ctx,
         clock_gettime(CLOCK_MONOTONIC, &now);
         return stopwatch_timespec_diff_ns(&sw->start.ts, &now);
     }
+#endif
 }
 
 /*
@@ -516,20 +563,26 @@ stopwatch_read_ticks(const struct stopwatch_context *ctx,
  * - Non-TSC mode:
  *     ns = ticks (ticks are already ns)
  */
-static __attribute__((always_inline)) inline uint64_t
+static STOPWATCH_INLINE uint64_t
 stopwatch_ticks_to_ns(const struct stopwatch_context *ctx, uint64_t ticks)
 {
+#ifdef _WIN32
+    /* Divide first so long-running timers do not overflow ticks * 1e9. */
+    return (ticks / ctx->qpc_hz) * UINT64_C(1000000000) +
+           (ticks % ctx->qpc_hz) * UINT64_C(1000000000) / ctx->qpc_hz;
+#else
     if (!ctx->use_tsc) {
         return ticks;
     }
 
-#if defined(__i386__) || defined(__x86_64__)
+#if !defined(_WIN32) && (defined(__i386__) || defined(__x86_64__))
     __int128 prod = (__int128)ticks * (__int128)ctx->tsc_mult;
     uint64_t ns = (uint64_t)(prod >> ctx->tsc_shift);
     return ns;
 #else
     /* Should not happen, but fallback. */
     return ticks;
+#endif
 #endif
 }
 
@@ -542,14 +595,18 @@ stopwatch_ticks_to_ns(const struct stopwatch_context *ctx, uint64_t ticks)
  * - Non-TSC mode:
  *     ticks = ns
  */
-static __attribute__((always_inline)) inline uint64_t
+static STOPWATCH_INLINE uint64_t
 stopwatch_ns_to_ticks(const struct stopwatch_context *ctx, uint64_t ns)
 {
+#ifdef _WIN32
+    return (ns / UINT64_C(1000000000)) * ctx->qpc_hz +
+           ((ns % UINT64_C(1000000000)) * ctx->qpc_hz + UINT64_C(999999999)) / UINT64_C(1000000000);
+#else
     if (!ctx->use_tsc) {
         return ns;
     }
 
-#if defined(__i386__) || defined(__x86_64__)
+#if !defined(_WIN32) && (defined(__i386__) || defined(__x86_64__))
     uint64_t tsc_hz = ctx->tsc_hz;
 
     /* ticks ≈ ns * tsc_hz / 1e9 (rounded) */
@@ -560,12 +617,13 @@ stopwatch_ns_to_ticks(const struct stopwatch_context *ctx, uint64_t ns)
 #else
     return ns;
 #endif
+#endif
 }
 
 /*
  * Convenience: directly get elapsed time in nanoseconds for a stopwatch.
  */
-static __attribute__((always_inline)) inline uint64_t
+static STOPWATCH_INLINE uint64_t
 stopwatch_elapsed_ns(const struct stopwatch_context *ctx,
                      const struct stopwatch *sw)
 {
