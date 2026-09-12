@@ -133,3 +133,18 @@ Benchmarking stopwatch vs clock_gettime
   rate     : 43.301 M calls/s
 ```
 
+
+## Windows
+
+Native MSVC x64 and ARM64 builds use QueryPerformanceCounter and cache its
+frequency in the context. Windows ticks are QPC ticks; use the conversion APIs
+for nanoseconds. No TSC calibration or POSIX runtime is needed.
+
+```powershell
+cmake -S . -B build -G "Visual Studio 17 2022" -A ARM64
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+```
+
+Use `-A x64` for Intel/AMD Windows. CMake builds the portable correctness test;
+`test.c` and `bench.c` remain Unix measurement/benchmark programs.
