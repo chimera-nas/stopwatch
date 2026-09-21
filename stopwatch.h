@@ -116,9 +116,28 @@
 
 /* ---------- Data structures ---------- */
 
+/* Wall time has its own fixed conversion and correction state. It never
+ * changes the monotonic stopwatch's calibration or conversion factors. */
+#ifndef _WIN32
+struct stopwatch_wall_clock {
+    uint64_t mult;
+    uint32_t shift;
+    unsigned int writer;
+    unsigned int sequence;
+    uint64_t base_ticks;
+    uint64_t base_ns;
+    int64_t adjustment_ns;
+    uint64_t refresh_ticks;
+    uint64_t last_ns;
+};
+#endif
+
 struct stopwatch_context {
 #ifdef _WIN32
     uint64_t qpc_hz;
+#endif
+#ifndef _WIN32
+    struct stopwatch_wall_clock wall;
 #endif
     int      use_tsc;         /* 0 = use clock_gettime, 1 = use TSC */
 
@@ -403,7 +422,7 @@ stopwatch_maybe_refine(struct stopwatch_context *ctx, uint64_t now_tsc)
  * - Otherwise: falls back to clock_gettime(CLOCK_MONOTONIC, ...).
  */
 static inline void
-stopwatch_context_init(struct stopwatch_context *ctx)
+stopwatch_monotonic_context_init(struct stopwatch_context *ctx)
 {
     ctx->use_tsc           = 0;
 #ifdef _WIN32
@@ -629,6 +648,223 @@ stopwatch_elapsed_ns(const struct stopwatch_context *ctx,
 {
     uint64_t ticks = stopwatch_read_ticks(ctx, sw);
     return stopwatch_ticks_to_ns(ctx, ticks);
+}
+
+
+/* ---------- Wall-clock API ---------- */
+
+/* Maximum rate adjustment in parts per million. 100000 = +/-10%: a 100 ms
+ * error takes at least one second to absorb. Set to 500 for traditional NTP
+ * rates. This must be identical in all translation units using a context. */
+#ifndef STOPWATCH_WALL_MAX_SLEW_PPM
+#define STOPWATCH_WALL_MAX_SLEW_PPM 100000
+#endif
+#if STOPWATCH_WALL_MAX_SLEW_PPM <= 0 || STOPWATCH_WALL_MAX_SLEW_PPM >= 1000000
+#error STOPWATCH_WALL_MAX_SLEW_PPM must be strictly between 0 and 1000000
+#endif
+
+#ifndef _WIN32
+/* An override lets the deterministic tests drive the TSC path on non-x86
+ * hosts as well. Applications should use the default hardware reader. */
+#ifndef STOPWATCH_WALL_TICKS
+static inline uint64_t
+stopwatch_wall_ticks(void)
+{
+#if defined(__i386__) || defined(__x86_64__)
+    return __rdtsc();
+#else
+    return 0; /* The native non-x86 context never enables TSC. */
+#endif
+}
+#define STOPWATCH_WALL_TICKS() stopwatch_wall_ticks()
+#endif
+
+struct stopwatch_wall_snapshot {
+    uint64_t now_ticks;
+    uint64_t base_ticks;
+    uint64_t base_ns;
+    int64_t adjustment_ns;
+    uint64_t refresh_ticks;
+};
+
+static inline uint64_t
+stopwatch_wall_elapsed(const struct stopwatch_wall_clock *wall, uint64_t ticks)
+{
+    return (uint64_t)(((unsigned __int128)ticks * wall->mult) >> wall->shift);
+}
+
+static inline uint64_t
+stopwatch_wall_estimate(const struct stopwatch_wall_clock *wall,
+                        const struct stopwatch_wall_snapshot *s, uint64_t ticks)
+{
+    uint64_t elapsed = ticks > s->base_ticks ?
+        stopwatch_wall_elapsed(wall, ticks - s->base_ticks) : 0;
+    /* Apply the pending adjustment over one second, then resume the nominal
+     * rate. Never keep applying a correction beyond the amount owed. */
+    uint64_t progress = elapsed < 1000000000ULL ? elapsed : 1000000000ULL;
+    int64_t correction = (int64_t)(((__int128)s->adjustment_ns * progress) /
+                                   1000000000LL);
+    return s->base_ns + elapsed + correction;
+}
+
+static inline void
+stopwatch_wall_snapshot(const struct stopwatch_wall_clock *wall,
+                        struct stopwatch_wall_snapshot *s)
+{
+    for (;;) {
+        unsigned int seq = __atomic_load_n(&wall->sequence, __ATOMIC_ACQUIRE);
+        if (seq & 1) continue;
+        s->base_ticks = __atomic_load_n(&wall->base_ticks, __ATOMIC_RELAXED);
+        s->base_ns = __atomic_load_n(&wall->base_ns, __ATOMIC_RELAXED);
+        s->adjustment_ns = __atomic_load_n(&wall->adjustment_ns, __ATOMIC_RELAXED);
+        s->refresh_ticks = __atomic_load_n(&wall->refresh_ticks, __ATOMIC_RELAXED);
+        s->now_ticks = STOPWATCH_WALL_TICKS();
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (seq == __atomic_load_n(&wall->sequence, __ATOMIC_RELAXED)) return;
+    }
+}
+
+/* Bracket CLOCK_REALTIME with ticks and keep the narrowest of three samples.
+ * A preempted sample must not be mistaken for clock drift. The midpoint
+ * bounds the pairing error to half the observed sampling interval. */
+static inline int
+stopwatch_wall_sample(const struct stopwatch_wall_clock *wall,
+                      uint64_t *ticks, uint64_t *ns)
+{
+    uint64_t best = UINT64_MAX;
+    for (int i = 0; i < 3; i++) {
+        struct timespec ts;
+        uint64_t before = STOPWATCH_WALL_TICKS();
+        int rc = clock_gettime(CLOCK_REALTIME, &ts);
+        uint64_t after = STOPWATCH_WALL_TICKS();
+        if (rc != 0 || after < before) continue;
+        uint64_t width = after - before;
+        if (width < best) {
+            best = width;
+            *ticks = before + width / 2;
+            *ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+        }
+    }
+    /* Reject pairs spanning over 1 ms. Keep the old curve and try again at
+     * the next refresh, rather than installing a scheduling-induced offset. */
+    return best != UINT64_MAX && stopwatch_wall_elapsed(wall, best) <= 1000000ULL;
+}
+
+static inline void
+stopwatch_wall_refresh(struct stopwatch_wall_clock *wall, uint64_t now)
+{
+    unsigned int expected = 0;
+    if (!__atomic_compare_exchange_n(&wall->writer, &expected, 1, 0,
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+
+    struct stopwatch_wall_snapshot s;
+    stopwatch_wall_snapshot(wall, &s);
+    if (now <= s.refresh_ticks ||
+        stopwatch_wall_elapsed(wall, now - s.refresh_ticks) < 1000000000ULL) {
+        __atomic_store_n(&wall->writer, 0, __ATOMIC_RELEASE);
+        return;
+    }
+
+    uint64_t ticks = 0, actual = 0;
+    if (stopwatch_wall_sample(wall, &ticks, &actual) && ticks >= s.base_ticks) {
+        uint64_t estimate = stopwatch_wall_estimate(wall, &s, ticks);
+        __int128 delta = (__int128)actual - estimate;
+        int64_t limit = (int64_t)STOPWATCH_WALL_MAX_SLEW_PPM * 1000;
+        s.base_ticks = ticks;
+        s.base_ns = estimate; /* Continuous at the anchor, even on a clock step. */
+        s.adjustment_ns = delta > limit ? limit : delta < -limit ? -limit : (int64_t)delta;
+    }
+    s.refresh_ticks = STOPWATCH_WALL_TICKS();
+
+    /* Readers keep using the old curve during the slow sampling operation.
+     * Only this short publication needs a seqlock; all shared fields are
+     * atomic so speculative readers are also free of C data races. */
+    __atomic_add_fetch(&wall->sequence, 1, __ATOMIC_ACQ_REL);
+    __atomic_store_n(&wall->base_ticks, s.base_ticks, __ATOMIC_RELAXED);
+    __atomic_store_n(&wall->base_ns, s.base_ns, __ATOMIC_RELAXED);
+    __atomic_store_n(&wall->adjustment_ns, s.adjustment_ns, __ATOMIC_RELAXED);
+    __atomic_store_n(&wall->refresh_ticks, s.refresh_ticks, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&wall->sequence, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&wall->writer, 0, __ATOMIC_RELEASE);
+}
+#endif /* !_WIN32 */
+
+/* Initialize before publishing the context to readers. Wall time uses the
+ * initial TSC conversion independently of later monotonic refinement. */
+static inline void
+stopwatch_context_init(struct stopwatch_context *ctx)
+{
+    stopwatch_monotonic_context_init(ctx);
+#ifndef _WIN32
+    struct stopwatch_wall_clock *wall = &ctx->wall;
+    wall->mult = ctx->tsc_mult;
+    wall->shift = ctx->tsc_shift;
+    wall->writer = 0;
+    wall->sequence = 0;
+    wall->base_ticks = 0;
+    wall->base_ns = 0;
+    wall->adjustment_ns = 0;
+    wall->refresh_ticks = 0;
+    wall->last_ns = 0;
+    if (ctx->use_tsc) {
+        /* If every initial sample was preempted, the narrowest valid pair
+         * still supplies an initial estimate. Later refreshes slew it. */
+        stopwatch_wall_sample(wall, &wall->base_ticks, &wall->base_ns);
+        wall->refresh_ticks = wall->base_ticks;
+        wall->last_ns = wall->base_ns;
+    }
+#endif
+}
+
+/* Unix-epoch wall time in nanoseconds. TSC mode is nondecreasing across
+ * readers of this context and slews toward CLOCK_REALTIME, without stepping.
+ * The fallback deliberately follows the system clock, including its steps.
+ * This API is thread-safe, but is not async-signal-safe in TSC mode. */
+static inline uint64_t
+stopwatch_realtime_ns(struct stopwatch_context *ctx)
+{
+#ifdef _WIN32
+    FILETIME ft;
+    ULARGE_INTEGER value;
+    (void)ctx;
+    GetSystemTimePreciseAsFileTime(&ft);
+    value.LowPart = ft.dwLowDateTime;
+    value.HighPart = ft.dwHighDateTime;
+    return (value.QuadPart - UINT64_C(116444736000000000)) * 100;
+#else
+    if (!ctx->use_tsc) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+    }
+    struct stopwatch_wall_clock *wall = &ctx->wall;
+    struct stopwatch_wall_snapshot s;
+    stopwatch_wall_snapshot(wall, &s);
+    uint64_t now = s.now_ticks;
+    if (now > s.refresh_ticks &&
+        stopwatch_wall_elapsed(wall, now - s.refresh_ticks) >= 1000000000ULL) {
+        stopwatch_wall_refresh(wall, now);
+        stopwatch_wall_snapshot(wall, &s);
+        now = s.now_ticks;
+    }
+    uint64_t ns = stopwatch_wall_estimate(wall, &s, now);
+    /* A reader may be delayed across a refresh or migrate between slightly
+     * skewed TSCs. Publish a high-water mark to cover those cases as well. */
+    uint64_t last = __atomic_load_n(&wall->last_ns, __ATOMIC_RELAXED);
+    while (ns > last) {
+        if (__atomic_compare_exchange_n(&wall->last_ns, &last, ns, 1,
+                                         __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return ns;
+    }
+    return last;
+#endif
+}
+
+static inline void
+stopwatch_realtime(struct stopwatch_context *ctx, struct timespec *ts)
+{
+    uint64_t ns = stopwatch_realtime_ns(ctx);
+    ts->tv_sec = (time_t)(ns / 1000000000ULL);
+    ts->tv_nsec = (long)(ns % 1000000000ULL);
 }
 
 #endif /* STOPWATCH_H */

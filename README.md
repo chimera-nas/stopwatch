@@ -69,6 +69,54 @@ For convenience, there is a wrapper to read a stopwatch directly into nanosecond
 uint64_t ns = stopwatch_elapsed_ns(&StopwatchCtx, &sw);
 ```
 
+## Wall time
+
+The same initialized context can provide Unix-epoch wall time:
+
+```c
+struct timespec ts;
+stopwatch_realtime(&StopwatchCtx, &ts);
+uint64_t ns = stopwatch_realtime_ns(&StopwatchCtx);
+```
+
+Without TSC, each read calls `clock_gettime(CLOCK_REALTIME)` directly. Windows
+uses `GetSystemTimePreciseAsFileTime`. These paths follow system-clock steps.
+
+With TSC, initialization pairs the real-time clock with a TSC sample. Reads
+estimate wall time from that anchor using an independent conversion factor.
+Approximately once per second, a reader resamples the system clock and adjusts
+the estimate's rate. Refreshes never step the estimate: positive errors speed
+it up and negative errors slow it down. Each adjustment ends after one second;
+any remaining error is measured again at the next refresh. Refreshes are lazy,
+so an idle context needs no background thread.
+
+`STOPWATCH_WALL_MAX_SLEW_PPM` bounds the rate adjustment. The default is 100000
+(10%): a 100 ms offset takes at least one second to absorb. Define it as 500
+for a traditional NTP-sized limit (the same correction then takes at least
+200 seconds). Use the same setting in every translation unit. A slew limit
+must be greater than zero and less than 1000000. Convergence requires the
+underlying TSC conversion error to be smaller than the allowed adjustment.
+Large system-clock changes intentionally take time to absorb; use the system
+clock directly when immediate agreement is required.
+
+Sampling brackets each clock read with TSC readings and selects the narrowest
+of three pairs. Refreshes reject pairs spanning more than 1 ms, avoiding false
+offsets caused by descheduling. Initial synchronization uses the narrowest
+valid pair even if it exceeds that threshold, then corrects it gradually.
+
+TSC results are nondecreasing for a shared context, including across concurrent
+readers and small inter-core TSC skew. Equal readings are possible; this is not
+a unique-ID generator. Readers use atomic snapshots and a shared high-water
+mark; one writer performs each refresh. Initialize before sharing a context,
+and do not reinitialize or copy it while readers are active. The TSC wall-time
+API is not async-signal-safe. Wall-time corrections never change the monotonic
+stopwatch's ticks, calibration, or conversions.
+
+CMake/CTest includes deterministic wall-time tests for forward/backward steps,
+rate limits, convergence, delayed sampling, idle periods, fallback behavior,
+and concurrent refreshes. They inject clock readings to exercise the TSC
+algorithm even on ARM hosts, at both the default slew rate and 500 ppm.
+
 ## Correctness
 
 There is an included correctness test that measures the accuracy of the stopwatch against clock_gettime():
