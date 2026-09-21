@@ -89,6 +89,18 @@ body_clock_gettime(void)
     clock_gettime(CLOCK_MONOTONIC, (struct timespec *)&g_sink_ts);
 }
 
+static void
+body_stopwatch_realtime(void)
+{
+    g_sink_u64 ^= stopwatch_realtime_ns(g_ctx);
+}
+
+static void
+body_clock_realtime(void)
+{
+    clock_gettime(CLOCK_REALTIME, (struct timespec *)&g_sink_ts);
+}
+
 /* Measure elapsed TSC ticks for `iterations` calls of the given body. */
 static uint64_t
 measure_ticks(struct stopwatch_context *ctx,
@@ -195,6 +207,9 @@ main(void)
     if (g_sink_u64 == 0xdeadbeefULL) {
         printf("sink: %" PRIu64 "\n", g_sink_u64);
     }
+
+    run_micro_benchmark(&ctx, "stopwatch_realtime_ns(&ctx)", body_stopwatch_realtime);
+    run_micro_benchmark(&ctx, "clock_gettime(CLOCK_REALTIME, &ts)", body_clock_realtime);
 
     return 0;
 }
